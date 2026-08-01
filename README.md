@@ -2,6 +2,12 @@
 
 A general-purpose node graph widget for [egui](https://github.com/emilk/egui).
 
+## ALT fork
+
+This repository is ALT's narrow, upstream-tracking fork of [`nannou-org/egui_graph`](https://github.com/nannou-org/egui_graph). The `alt` branch retains upstream history and carries only the behavior required by ALT's native Team and execution canvases.
+
+The fork adds pointer-anchored wheel zoom without a modifier key, configurable primary-button canvas panning for read-only views, reflection-symmetric placement for degree-one boundary ports, and two-corner obstacle detours whose adjacent segments remain outside the blocked node. Each change is covered by a focused invariant test. Generic graph behavior otherwise remains upstream-owned, and applicable upstream changes should be merged rather than reimplemented here.
+
 Build interactive node-based editors with nodes connected by edges for visual
 programming interfaces, shader editors, DSP graphs, or any graph-based UI.
 
