@@ -22,6 +22,12 @@ pub mod socket;
 pub struct Graph {
     background: bool,
     dot_grid: bool,
+    /// Treat an unmodified mouse wheel over the graph as zoom instead of pan.
+    wheel_zoom: bool,
+    /// Pointer buttons which pan the graph's scene when dragged.
+    drag_pan_buttons: egui::containers::DragPanButtons,
+    /// Whether a primary-button drag on empty canvas creates a selection box.
+    marquee_selection: bool,
     /// The base spacing of the dot grid in graph-space units, or `None` to
     /// derive it from the style's interaction size.
     dot_grid_step: Option<f32>,
@@ -374,6 +380,9 @@ impl Graph {
         Self {
             background: true,
             dot_grid: true,
+            wheel_zoom: false,
+            drag_pan_buttons: egui::containers::DragPanButtons::MIDDLE,
+            marquee_selection: true,
             dot_grid_step: None,
             zoom_range: Self::DEFAULT_ZOOM_RANGE,
             max_inner_size: None,
@@ -402,6 +411,34 @@ impl Graph {
     /// Whether or not to show the dot grid. Default is `true`.
     pub fn dot_grid(mut self, show: bool) -> Self {
         self.dot_grid = show;
+        self
+    }
+
+    /// Use the ordinary mouse wheel to zoom around the pointer.
+    ///
+    /// egui's `Scene` reserves unmodified wheel input for panning and requires
+    /// Ctrl+wheel for zoom. Graph editors conventionally use the wheel for
+    /// zoom, so callers can opt into that interaction directly.
+    pub fn wheel_zoom(mut self, enabled: bool) -> Self {
+        self.wheel_zoom = enabled;
+        self
+    }
+
+    /// Choose which pointer buttons pan the graph canvas when dragged.
+    ///
+    /// The default is the middle button so editable graphs retain primary-drag
+    /// marquee selection. Immutable viewers commonly use the primary button
+    /// and disable marquee selection.
+    pub fn drag_pan_buttons(mut self, buttons: egui::containers::DragPanButtons) -> Self {
+        self.drag_pan_buttons = buttons;
+        self
+    }
+
+    /// Enable or disable primary-drag marquee selection on empty canvas.
+    ///
+    /// Direct node clicks remain selectable when this is disabled.
+    pub fn marquee_selection(mut self, enabled: bool) -> Self {
+        self.marquee_selection = enabled;
         self
     }
 
@@ -612,10 +649,45 @@ impl Graph {
             gmem.last_viewport_size = Some(viewport_size);
         }
 
+        // Graph editors conventionally zoom with the unmodified mouse wheel.
+        // Consume that wheel input before `Scene` turns it into a pan and
+        // update the visible scene rectangle around the pointer. This keeps
+        // the point under the cursor stable and leaves wheel events outside
+        // the graph untouched.
+        if self.wheel_zoom
+            && scene_rect.is_finite()
+            && scene_rect.width() > 0.0
+            && scene_rect.height() > 0.0
+        {
+            let viewport = ui.available_rect_before_wrap();
+            if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+                if !viewport.contains(pointer) {
+                    // Leave wheel input outside the graph untouched.
+                } else {
+                    let wheel = ui.input_mut(|input| {
+                        let value = input.smooth_scroll_delta.y;
+                        if value != 0.0 {
+                            input.smooth_scroll_delta = egui::Vec2::ZERO;
+                        }
+                        value
+                    });
+                    if wheel != 0.0 {
+                        *scene_rect = wheel_zoom_scene_rect(
+                            *scene_rect,
+                            viewport,
+                            pointer,
+                            wheel,
+                            self.zoom_range,
+                        );
+                    }
+                }
+            }
+        }
+
         // Create the Scene.
         let mut scene = egui::containers::Scene::new()
             .zoom_range(self.zoom_range)
-            .drag_pan_buttons(egui::containers::DragPanButtons::MIDDLE);
+            .drag_pan_buttons(self.drag_pan_buttons);
         if let Some(max_inner_size) = self.max_inner_size {
             scene = scene.max_inner_size(max_inner_size);
         }
@@ -693,6 +765,7 @@ impl Graph {
                     ptr_on_graph,
                     ptr_graph,
                     gmem.pressed.as_ref(),
+                    self.marquee_selection,
                 );
 
                 // Move all selected nodes by a single delta (skip when
@@ -1286,6 +1359,7 @@ fn graph_interaction(
     ptr_on_graph: bool,
     ptr_graph: egui::Pos2,
     pressed: Option<&Pressed>,
+    marquee_selection: bool,
 ) -> GraphInteraction {
     let mut select = false;
     let mut socket_press_released = None;
@@ -1328,7 +1402,8 @@ fn graph_interaction(
             })
         }
     // Check for the beginning of a socket press or rectangular selection.
-    } else if ptr_on_graph
+    } else if marquee_selection
+        && ptr_on_graph
         && pointer.button_down(egui::PointerButton::Primary)
         && pointer.button_pressed(egui::PointerButton::Primary)
     {
@@ -1481,6 +1556,41 @@ fn maintain_zoom_scene_rect(
     // aspect ratio - the steady-state shape egui itself produces - while
     // keeping the center fixed. Next frame egui's fit yields `scale` again.
     egui::Rect::from_center_size(scene_rect.center(), cur / scale)
+}
+
+/// Return the scene rectangle produced by one unmodified mouse-wheel zoom.
+///
+/// The graph-space point beneath `pointer` remains beneath that same screen
+/// coordinate. Positive wheel deltas zoom in; negative deltas zoom out.
+fn wheel_zoom_scene_rect(
+    scene: egui::Rect,
+    viewport: egui::Rect,
+    pointer: egui::Pos2,
+    wheel: f32,
+    zoom_range: egui::Rangef,
+) -> egui::Rect {
+    if !scene.is_finite()
+        || !viewport.is_finite()
+        || scene.width() <= 0.0
+        || scene.height() <= 0.0
+        || viewport.width() <= 0.0
+        || viewport.height() <= 0.0
+        || wheel == 0.0
+    {
+        return scene;
+    }
+    let current_scale = (viewport.size() / scene.size())
+        .min_elem()
+        .clamp(zoom_range.min, zoom_range.max);
+    let target_scale = zoom_range.clamp(current_scale * (wheel * 0.01).exp());
+    if target_scale == current_scale {
+        return scene;
+    }
+    let translation = viewport.center().to_vec2() - current_scale * scene.center().to_vec2();
+    let anchor = ((pointer.to_vec2() - translation) / current_scale).to_pos2();
+    let new_size = viewport.size() / target_scale;
+    let new_center = anchor - (pointer - viewport.center()) / target_scale;
+    egui::Rect::from_center_size(new_center, new_size)
 }
 
 /// Snap a scalar to a multiple of `step` according to `snap`.
@@ -1652,7 +1762,11 @@ fn align_adjust(
     type Best = Option<(f32, f32, egui::Rect)>; // (adjust, pos, reference rect)
     let consider = |best: &mut Best, dragged: f32, reference: f32, r: egui::Rect| {
         let adjust = reference - dragged;
-        if adjust.abs() <= threshold && best.map_or(true, |(b, _, _)| adjust.abs() < b.abs()) {
+        let is_better = match *best {
+            None => true,
+            Some((current, _, _)) => adjust.abs() < current.abs(),
+        };
+        if adjust.abs() <= threshold && is_better {
             *best = Some((adjust, reference, r));
         }
     };
@@ -1738,7 +1852,7 @@ fn memory(ui: &egui::Ui, graph_id: egui::Id) -> Arc<Mutex<GraphTempMemory>> {
 mod tests {
     use super::{
         align_adjust, align_nodes, dot_grid_step, infer_alignment, maintain_zoom_scene_rect,
-        snap_f32, AlignBy, AlignTargets, Alignment, Layout, NodeId, Snap,
+        snap_f32, wheel_zoom_scene_rect, AlignBy, AlignTargets, Alignment, Layout, NodeId, Snap,
     };
     use egui::{Rangef, Rect, Vec2};
     use std::collections::HashMap;
@@ -1747,6 +1861,160 @@ mod tests {
     /// viewport of `size` (the binding/letterbox axis).
     fn fit_scale(size: Vec2, scene_rect: Rect) -> f32 {
         (size / scene_rect.size()).min_elem()
+    }
+
+    fn scene_to_global(scene: Rect, viewport: Rect, point: egui::Pos2) -> egui::Pos2 {
+        let scale = fit_scale(viewport.size(), scene);
+        let translation = viewport.center().to_vec2() - scale * scene.center().to_vec2();
+        (translation + scale * point.to_vec2()).to_pos2()
+    }
+
+    #[test]
+    fn ordinary_wheel_zoom_is_pointer_anchored() {
+        let viewport = Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(1200.0, 700.0));
+        let scene = Rect::from_center_size(egui::pos2(40.0, -20.0), egui::vec2(2400.0, 1400.0));
+        let pointer = egui::pos2(930.0, 310.0);
+        let before_scale = fit_scale(viewport.size(), scene);
+        let translation = viewport.center().to_vec2() - before_scale * scene.center().to_vec2();
+        let anchor = ((pointer.to_vec2() - translation) / before_scale).to_pos2();
+
+        let zoomed = wheel_zoom_scene_rect(scene, viewport, pointer, 60.0, Rangef::new(0.08, 3.0));
+
+        assert!(fit_scale(viewport.size(), zoomed) > before_scale);
+        let remapped = scene_to_global(zoomed, viewport, anchor);
+        assert!(
+            (remapped - pointer).length() < 0.001,
+            "{remapped:?} != {pointer:?}"
+        );
+    }
+
+    #[test]
+    fn graph_widget_consumes_unmodified_wheel_as_zoom() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let pointer = egui::pos2(650.0, 280.0);
+        let mut view = super::View {
+            scene_rect: Rect::from_min_size(egui::pos2(-900.0, -600.0), egui::vec2(1800.0, 1200.0)),
+            layout: Default::default(),
+        };
+        let before = view.scene_rect;
+        let mut remaining_wheel = f32::NAN;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 60.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let _ = ctx.run_ui(input, |ui| {
+            super::Graph::new("ordinary-wheel-integration")
+                .wheel_zoom(true)
+                .zoom_range(Rangef::new(0.08, 3.0))
+                .show(&mut view, ui, |_ui, _show| {});
+            remaining_wheel = ui.input(|state| state.smooth_scroll_delta.y);
+        });
+
+        assert!(
+            view.scene_rect.width() < before.width(),
+            "wheel event did not zoom: {before:?} -> {:?}",
+            view.scene_rect
+        );
+        assert_eq!(
+            remaining_wheel, 0.0,
+            "wheel event remained available for Scene panning"
+        );
+    }
+
+    #[test]
+    fn immutable_viewer_primary_drag_pans_empty_canvas() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let start = egui::pos2(300.0, 240.0);
+        let end = egui::pos2(420.0, 320.0);
+        let mut view = super::View {
+            scene_rect: Rect::from_min_size(egui::pos2(-900.0, -600.0), egui::vec2(1800.0, 1200.0)),
+            layout: Default::default(),
+        };
+
+        let warmup = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::PointerMoved(start)],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(warmup, |ui| {
+            super::Graph::new("primary-pan-integration")
+                .immutable(true)
+                .drag_pan_buttons(
+                    egui::containers::DragPanButtons::PRIMARY
+                        | egui::containers::DragPanButtons::MIDDLE,
+                )
+                .marquee_selection(false)
+                .show(&mut view, ui, |_ui, _show| {});
+        });
+
+        let press = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(press, |ui| {
+            super::Graph::new("primary-pan-integration")
+                .immutable(true)
+                .drag_pan_buttons(
+                    egui::containers::DragPanButtons::PRIMARY
+                        | egui::containers::DragPanButtons::MIDDLE,
+                )
+                .marquee_selection(false)
+                .show(&mut view, ui, |_ui, _show| {});
+        });
+        let before_drag = view.scene_rect;
+
+        let drag = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::PointerMoved(end)],
+            ..Default::default()
+        };
+        let mut dragged = false;
+        let mut delta = egui::Vec2::ZERO;
+        let mut pointer_down = false;
+        let mut pointer_delta = egui::Vec2::ZERO;
+        let _ = ctx.run_ui(drag, |ui| {
+            pointer_down = ui.input(|input| {
+                pointer_delta = input.pointer.delta();
+                input.pointer.button_down(egui::PointerButton::Primary)
+            });
+            let response = super::Graph::new("primary-pan-integration")
+                .immutable(true)
+                .drag_pan_buttons(
+                    egui::containers::DragPanButtons::PRIMARY
+                        | egui::containers::DragPanButtons::MIDDLE,
+                )
+                .marquee_selection(false)
+                .show(&mut view, ui, |_ui, _show| {});
+            dragged = response.response.dragged_by(egui::PointerButton::Primary);
+            delta = response.response.drag_delta();
+        });
+
+        assert!(
+            (view.scene_rect.center() - before_drag.center()).length() > 1.0,
+            "primary drag did not pan (down={pointer_down}, pointer_delta={pointer_delta:?}, dragged={dragged}, delta={delta:?}): {before_drag:?} -> {:?}",
+            view.scene_rect
+        );
     }
 
     #[test]

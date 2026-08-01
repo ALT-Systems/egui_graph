@@ -162,18 +162,25 @@ fn resolve_positions(
 /// `count` sockets evenly spaced along an edge of length `cross_len`, inset by
 /// `socket_padding` at both ends.
 ///
-/// A lone socket sits at the padded start of the edge.
+/// A lone socket sits at the boundary midpoint. Two or more sockets span the
+/// padded interval. The midpoint is the unique reflection-symmetric position
+/// for degree one and avoids introducing a visually arbitrary corner bias.
 pub(crate) fn evenly_spaced_cross_offsets(
     count: usize,
     cross_len: f32,
     socket_padding: f32,
 ) -> impl Iterator<Item = f32> {
+    let start = if count == 1 {
+        cross_len * 0.5
+    } else {
+        socket_padding
+    };
     let gap = if count > 1 {
         (cross_len - socket_padding * 2.0) / (count - 1) as f32
     } else {
         0.0
     };
-    (0..count).map(move |ix| socket_padding + gap * ix as f32)
+    (0..count).map(move |ix| start + gap * ix as f32)
 }
 
 /// The position of a socket on the node's main-axis edge given its absolute
@@ -233,4 +240,21 @@ fn resolve_explicit(
     map.iter()
         .map(|(&ix, &cross)| (ix, socket_pos(flow, rect, is_input, cross)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evenly_spaced_cross_offsets;
+
+    #[test]
+    fn degree_one_is_reflection_symmetric_and_higher_degrees_span_the_interval() {
+        let one: Vec<_> = evenly_spaced_cross_offsets(1, 200.0, 12.0).collect();
+        assert_eq!(one, vec![100.0]);
+
+        let two: Vec<_> = evenly_spaced_cross_offsets(2, 200.0, 12.0).collect();
+        assert_eq!(two, vec![12.0, 188.0]);
+
+        let three: Vec<_> = evenly_spaced_cross_offsets(3, 200.0, 12.0).collect();
+        assert_eq!(three, vec![12.0, 100.0, 188.0]);
+    }
 }

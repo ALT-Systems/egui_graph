@@ -114,10 +114,11 @@ fn sanitize_pos(pos: egui::Pos2) -> egui::Pos2 {
 /// Recursively detour the segment `p -> q` around the nearest node it
 /// crosses, appending the detour waypoints in path order.
 ///
-/// Each detour rounds the nearer cross-axis side of the blocking node at the
-/// node's main-axis centre, mirroring the corridor waypoints the layered
-/// layout produces. Nodes containing either endpoint cannot be dodged and
-/// are skipped.
+/// Each detour enters and leaves a corridor along the nearer cross-axis side
+/// of the blocking node. Two corner waypoints are required: a single waypoint
+/// at the side's centre can leave both adjacent segments cutting through the
+/// rectangle it was intended to avoid. Nodes containing either endpoint
+/// cannot be dodged and are skipped.
 #[allow(clippy::too_many_arguments)]
 fn dodge(
     rects: &[egui::Rect],
@@ -146,24 +147,55 @@ fn dodge(
         })
         .min_by(|a, b| a.0.total_cmp(&b.0));
     let Some((_, rect)) = hit else { return };
-    let wp = if horizontal {
+    let (entry, exit) = if horizontal {
         let y = if (p.y + q.y) * 0.5 < rect.center().y {
             rect.min.y
         } else {
             rect.max.y
         };
-        egui::Pos2::new(rect.center().x, y)
+        if p.x <= q.x {
+            (
+                egui::Pos2::new(rect.min.x, y),
+                egui::Pos2::new(rect.max.x, y),
+            )
+        } else {
+            (
+                egui::Pos2::new(rect.max.x, y),
+                egui::Pos2::new(rect.min.x, y),
+            )
+        }
     } else {
         let x = if (p.x + q.x) * 0.5 < rect.center().x {
             rect.min.x
         } else {
             rect.max.x
         };
-        egui::Pos2::new(x, rect.center().y)
+        if p.y <= q.y {
+            (
+                egui::Pos2::new(x, rect.min.y),
+                egui::Pos2::new(x, rect.max.y),
+            )
+        } else {
+            (
+                egui::Pos2::new(x, rect.max.y),
+                egui::Pos2::new(x, rect.min.y),
+            )
+        }
     };
-    dodge(rects, skip, horizontal, clearance, p, wp, depth - 1, out);
-    out.push(wp);
-    dodge(rects, skip, horizontal, clearance, wp, q, depth - 1, out);
+    dodge(rects, skip, horizontal, clearance, p, entry, depth - 1, out);
+    out.push(entry);
+    dodge(
+        rects,
+        skip,
+        horizontal,
+        clearance,
+        entry,
+        exit,
+        depth - 1,
+        out,
+    );
+    out.push(exit);
+    dodge(rects, skip, horizontal, clearance, exit, q, depth - 1, out);
 }
 
 /// The parameter at which the segment `p + t * (q - p)` first enters `rect`,
@@ -245,6 +277,14 @@ mod tests {
         for wp in route {
             assert!(!blocker.contains(*wp), "waypoint inside the blocker");
         }
+        let mut path = vec![egui::pos2(100.0, 25.0)];
+        path.extend_from_slice(route);
+        path.push(egui::pos2(300.0, 25.0));
+        assert!(
+            path.windows(2)
+                .all(|segment| segment_rect_entry(segment[0], segment[1], blocker).is_none()),
+            "detour segments cross the blocker: {path:?}"
+        );
     }
 
     #[test]

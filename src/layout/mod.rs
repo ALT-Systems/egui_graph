@@ -19,6 +19,11 @@ mod place;
 mod rank;
 mod route;
 
+type EdgeKey = ((NodeId, OutputIx), (NodeId, InputIx));
+type EdgeRouteOccurrences = Vec<Vec<egui::Pos2>>;
+type CanonicalPoint = (f32, f32);
+type ConnectedLayout = (Vec<CanonicalPoint>, Vec<Vec<CanonicalPoint>>, Bounds);
+
 /// Per-node input to [`layout`]: the node's size and the layout of its
 /// sockets.
 pub struct LayoutNode {
@@ -61,7 +66,7 @@ pub struct LayoutParams {
 /// threading edges through outdated corridors.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EdgeRoutes {
-    routes: HashMap<((NodeId, OutputIx), (NodeId, InputIx)), Vec<Vec<egui::Pos2>>>,
+    routes: HashMap<EdgeKey, EdgeRouteOccurrences>,
 }
 
 /// Socket positions along a node's edge, mirroring
@@ -374,9 +379,9 @@ pub fn layout_routed(
     }
     let mut members_by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut local_of = vec![0usize; ids.len()];
-    for v in 0..ids.len() {
+    for (v, local) in local_of.iter_mut().enumerate() {
         let members = members_by_root.entry(uf_find(&mut parent, v)).or_default();
-        local_of[v] = members.len();
+        *local = members.len();
         members.push(v);
     }
     // When ignoring sockets, collapse the socket indices fed to the layout
@@ -436,9 +441,10 @@ pub fn layout_routed(
     // symmetries; with one flow there are no cross-cluster edges). Mixed
     // flows are arranged by an outer pass that gives each cluster its own
     // orientation, so canonical cross axes never collide in screen space.
-    let single_flow = node_flow
-        .first()
-        .map_or(true, |&f0| node_flow.iter().all(|&f| f == f0));
+    let single_flow = match node_flow.first() {
+        None => true,
+        Some(&f0) => node_flow.iter().all(|&f| f == f0),
+    };
     let (mut tls, mut edge_waypoints) = if single_flow {
         arrange_packed(&mut placed, &params, &size_screen, ids.len(), cedges.len())
     } else {
@@ -527,10 +533,7 @@ pub fn layout_from_sizes(
 /// the `(main, cross)` centre of each node, the corridor waypoints of each
 /// edge (ordered from its output end to its input end), and the component
 /// bounds.
-fn layout_connected(
-    cg: &CGraph,
-    params: &LayoutParams,
-) -> (Vec<(f32, f32)>, Vec<Vec<(f32, f32)>>, Bounds) {
+fn layout_connected(cg: &CGraph, params: &LayoutParams) -> ConnectedLayout {
     let n = cg.size_main.len();
     let pairs: Vec<(usize, usize)> = cg.edges.iter().map(|e| (e.src, e.dst)).collect();
     let reversed = acyclic::break_cycles(n, &pairs);
@@ -1092,8 +1095,8 @@ mod tests {
             .collect();
         let edges = vec![((nid(0), 0), (nid(1), 0)), ((nid(1), 0), (nid(2), 0))];
         let l = layout(nodes, edges, egui::Direction::LeftToRight);
-        // A lone socket sits `padding` below the node's top edge.
-        let socket_y = |v: u64| l[&nid(v)].y + padding;
+        // Degree-one boundary ports are centred on each node edge.
+        let socket_y = |v: u64| l[&nid(v)].y + sizes[v as usize].y * 0.5;
         assert!((socket_y(0) - socket_y(1)).abs() < 1e-3);
         assert!((socket_y(1) - socket_y(2)).abs() < 1e-3);
     }
