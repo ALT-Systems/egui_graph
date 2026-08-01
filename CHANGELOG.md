@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Zoom the graph around the pointer with an unmodified mouse-wheel gesture.
+- Allow immutable graph surfaces to use primary-button background dragging for panning instead of marquee selection.
+- Place a single boundary socket at the reflection-symmetric midpoint of its node edge.
+
+### Fixed
+
+- Route obstacle detours through entry and exit corners so adjacent path segments do not cross the blocked rectangle.
+
 ## [0.16.2](https://github.com/nannou-org/egui_graph/compare/v0.16.1...v0.16.2) - 2026-07-13
 
 ### Added
