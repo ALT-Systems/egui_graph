@@ -746,13 +746,12 @@ impl Graph {
                 // the pointer being over the scene background *or* a node frame, so
                 // sockets straddling a frame edge are detectable from either side.
                 let ptr_over_graph = ptr_on_graph || ptr_over_node_prev;
-                closest_socket = if ptr_over_graph {
+                closest_socket = if ptr_over_graph || graph_rect.contains(ptr_global) {
                     find_closest_socket(ptr_graph, layout, &gmem, ui)
                         .map(|(socket, _dist_sqrd)| socket)
                 } else {
                     None
                 };
-
                 // When immutable, suppress socket presses (map to Select).
                 let closest_socket_for_interaction =
                     if self.immutable { None } else { closest_socket };
@@ -762,7 +761,7 @@ impl Graph {
                     layout,
                     &pointer,
                     closest_socket_for_interaction,
-                    ptr_on_graph,
+                    ptr_on_graph || closest_socket_for_interaction.is_some(),
                     ptr_graph,
                     gmem.pressed.as_ref(),
                     self.marquee_selection,
