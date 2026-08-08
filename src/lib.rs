@@ -67,6 +67,10 @@ pub struct Graph {
     /// The stroke for alignment guide lines (width in screen pixels), or `None`
     /// to derive a subtle default from the style.
     align_guide_stroke: Option<egui::Stroke>,
+    /// Whether dragged nodes are projected away from non-selected nodes.
+    prevent_node_overlap: bool,
+    /// Empty graph-space distance preserved around nodes during dragging.
+    node_clearance: f32,
 }
 
 /// How the view responds when the available viewport size changes
@@ -369,6 +373,11 @@ impl Graph {
     pub const DEFAULT_ALIGN_GUIDES: bool = true;
     /// The default guide stroke. `None` derives a subtle stroke from the style.
     pub const DEFAULT_ALIGN_GUIDE_STROKE: Option<egui::Stroke> = None;
+    /// Collision projection is opt-in so existing consumers retain their
+    /// interaction contract.
+    pub const DEFAULT_PREVENT_NODE_OVERLAP: bool = false;
+    /// The default node clearance used by collision projection.
+    pub const DEFAULT_NODE_CLEARANCE: f32 = 0.0;
 
     /// Begin building the new graph widget.
     pub fn new(id_src: impl Hash) -> Self {
@@ -399,6 +408,8 @@ impl Graph {
             align_disable_modifier: Self::DEFAULT_ALIGN_DISABLE_MODIFIER,
             align_guides: Self::DEFAULT_ALIGN_GUIDES,
             align_guide_stroke: Self::DEFAULT_ALIGN_GUIDE_STROKE,
+            prevent_node_overlap: Self::DEFAULT_PREVENT_NODE_OVERLAP,
+            node_clearance: Self::DEFAULT_NODE_CLEARANCE,
         }
     }
 
@@ -552,6 +563,29 @@ impl Graph {
     /// Default: [`Self::DEFAULT_ALIGN`] (`true`).
     pub fn align(mut self, align: bool) -> Self {
         self.align = align;
+        self
+    }
+
+    /// Prevent a dragged node or rigid multi-node selection from overlapping
+    /// non-selected nodes.
+    ///
+    /// Movement is continuously swept against node rectangles and may slide
+    /// along the first contacted side. This prevents both final overlap and
+    /// tunnelling through a node during a large pointer movement.
+    ///
+    /// Default: [`Self::DEFAULT_PREVENT_NODE_OVERLAP`] (`false`).
+    pub fn prevent_node_overlap(mut self, prevent: bool) -> Self {
+        self.prevent_node_overlap = prevent;
+        self
+    }
+
+    /// Set the empty graph-space distance preserved between dragged and
+    /// stationary nodes when overlap prevention is enabled.
+    ///
+    /// Negative or non-finite values are treated as zero.
+    /// Default: [`Self::DEFAULT_NODE_CLEARANCE`] (`0.0`).
+    pub fn node_clearance(mut self, clearance: f32) -> Self {
+        self.node_clearance = clearance;
         self
     }
 
@@ -802,32 +836,34 @@ impl Graph {
                                 .unwrap_or_else(|| ui.style().interaction.interact_radius);
                             let threshold = threshold_px / scale;
 
+                            let selected_rects: Vec<egui::Rect> = gmem
+                                .selection
+                                .nodes
+                                .iter()
+                                .filter_map(|id| {
+                                    let pos = *layout.get(id)?;
+                                    let size = *gmem.node_sizes.get(id)?;
+                                    Some(egui::Rect::from_min_size(pos, size))
+                                })
+                                .collect();
+                            // Sort references by id for deterministic
+                            // alignment and collision tie-breaks (HashMap
+                            // iteration order is unstable).
+                            let mut refs: Vec<(NodeId, egui::Rect)> = layout
+                                .iter()
+                                .filter(|(id, _)| !gmem.selection.nodes.contains(id))
+                                .filter_map(|(id, &pos)| {
+                                    let size = *gmem.node_sizes.get(id)?;
+                                    Some((*id, egui::Rect::from_min_size(pos, size)))
+                                })
+                                .collect();
+                            refs.sort_by_key(|(id, _)| *id);
+                            let reference_rects: Vec<egui::Rect> =
+                                refs.into_iter().map(|(_, rect)| rect).collect();
+
                             // Per-axis alignment of the dragged group's bounding
                             // box to the surrounding (non-selected) nodes.
                             let (line_x, line_y) = if align_on {
-                                let selected_rects: Vec<egui::Rect> = gmem
-                                    .selection
-                                    .nodes
-                                    .iter()
-                                    .filter_map(|id| {
-                                        let pos = *layout.get(id)?;
-                                        let size = *gmem.node_sizes.get(id)?;
-                                        Some(egui::Rect::from_min_size(pos, size))
-                                    })
-                                    .collect();
-                                // Sort references by id for deterministic
-                                // tie-breaks (HashMap order is unstable).
-                                let mut refs: Vec<(NodeId, egui::Rect)> = layout
-                                    .iter()
-                                    .filter(|(id, _)| !gmem.selection.nodes.contains(id))
-                                    .filter_map(|(id, &pos)| {
-                                        let size = *gmem.node_sizes.get(id)?;
-                                        Some((*id, egui::Rect::from_min_size(pos, size)))
-                                    })
-                                    .collect();
-                                refs.sort_by_key(|(id, _)| *id);
-                                let reference_rects: Vec<egui::Rect> =
-                                    refs.into_iter().map(|(_, r)| r).collect();
                                 align_adjust(
                                     self.align_targets,
                                     &selected_rects,
@@ -861,6 +897,16 @@ impl Graph {
                                 axis(line_x, raw.x, anchor.map(|p| p.x)),
                                 axis(line_y, raw.y, anchor.map(|p| p.y)),
                             );
+                            let delta = if self.prevent_node_overlap {
+                                collision_free_drag_delta(
+                                    &selected_rects,
+                                    &reference_rects,
+                                    delta,
+                                    self.node_clearance,
+                                )
+                            } else {
+                                delta
+                            };
 
                             // Record the aligning edges so a subtle guide can be
                             // drawn along them once the nodes are laid out.
@@ -1806,6 +1852,136 @@ fn align_adjust(
     (line_x, line_y)
 }
 
+/// Project a rigid drag onto collision-free space while preserving as much of
+/// the pointer movement as possible. The first sweep reaches exact contact;
+/// the second slides the remaining movement along the contacted side.
+fn collision_free_drag_delta(
+    selected_rects: &[egui::Rect],
+    reference_rects: &[egui::Rect],
+    requested: egui::Vec2,
+    clearance: f32,
+) -> egui::Vec2 {
+    if selected_rects.is_empty()
+        || reference_rects.is_empty()
+        || !requested.is_finite()
+        || requested == egui::Vec2::ZERO
+    {
+        return requested;
+    }
+    let clearance = if clearance.is_finite() {
+        clearance.max(0.0)
+    } else {
+        0.0
+    };
+    let obstacles: Vec<_> = reference_rects
+        .iter()
+        .copied()
+        .map(|rect| rect.expand(clearance))
+        .collect();
+    let mut moved = egui::Vec2::ZERO;
+    let mut remaining = requested;
+
+    // A rectangle in 2D has two independent collision normals. Two sweeps are
+    // therefore sufficient: reach the first side, then slide along it until a
+    // possible second side is reached.
+    for _ in 0..2 {
+        if remaining == egui::Vec2::ZERO {
+            break;
+        }
+        let mut first: Option<(f32, CollisionNormal)> = None;
+        for rect in selected_rects {
+            let moving = rect.translate(moved);
+            for obstacle in &obstacles {
+                let Some(hit) = swept_rect_hit(moving, *obstacle, remaining) else {
+                    continue;
+                };
+                if first.is_none_or(|current| hit.0 < current.0) {
+                    first = Some(hit);
+                }
+            }
+        }
+        let Some((fraction, normal)) = first else {
+            moved += remaining;
+            break;
+        };
+        moved += remaining * fraction.clamp(0.0, 1.0);
+        remaining *= 1.0 - fraction.clamp(0.0, 1.0);
+        match normal {
+            CollisionNormal::Horizontal => remaining.x = 0.0,
+            CollisionNormal::Vertical => remaining.y = 0.0,
+        }
+    }
+    moved
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollisionNormal {
+    Horizontal,
+    Vertical,
+}
+
+/// Earliest continuous collision of a moving axis-aligned rectangle with a
+/// stationary one. Rectangles already overlapping are ignored so a malformed
+/// or legacy layout can always be dragged apart.
+fn swept_rect_hit(
+    moving: egui::Rect,
+    obstacle: egui::Rect,
+    delta: egui::Vec2,
+) -> Option<(f32, CollisionNormal)> {
+    if strict_rect_overlap(moving, obstacle) {
+        return None;
+    }
+
+    let axis_times =
+        |moving_min: f32, moving_max: f32, obstacle_min: f32, obstacle_max: f32, movement: f32| {
+            if movement > 0.0 {
+                Some((
+                    (obstacle_min - moving_max) / movement,
+                    (obstacle_max - moving_min) / movement,
+                ))
+            } else if movement < 0.0 {
+                Some((
+                    (obstacle_max - moving_min) / movement,
+                    (obstacle_min - moving_max) / movement,
+                ))
+            } else if moving_max <= obstacle_min || moving_min >= obstacle_max {
+                None
+            } else {
+                Some((f32::NEG_INFINITY, f32::INFINITY))
+            }
+        };
+
+    let (x_entry, x_exit) = axis_times(
+        moving.min.x,
+        moving.max.x,
+        obstacle.min.x,
+        obstacle.max.x,
+        delta.x,
+    )?;
+    let (y_entry, y_exit) = axis_times(
+        moving.min.y,
+        moving.max.y,
+        obstacle.min.y,
+        obstacle.max.y,
+        delta.y,
+    )?;
+    let entry = x_entry.max(y_entry);
+    let exit = x_exit.min(y_exit);
+    if entry > exit || exit < 0.0 || !(0.0..=1.0).contains(&entry) {
+        return None;
+    }
+    let normal = if x_entry > y_entry {
+        CollisionNormal::Horizontal
+    } else {
+        CollisionNormal::Vertical
+    };
+    Some((entry, normal))
+}
+
+fn strict_rect_overlap(a: egui::Rect, b: egui::Rect) -> bool {
+    a.min.x < b.max.x && b.min.x < a.max.x && a.min.y < b.max.y && b.min.y < a.max.y
+}
+
 /// Paint the subtle alignment guide lines collected during a drag. Each entry
 /// is `(is_x_axis, line)`: an x-axis match draws a vertical line, a y-axis match
 /// a horizontal one. Drawn in graph space; the stroke width is treated as screen
@@ -1850,8 +2026,9 @@ fn memory(ui: &egui::Ui, graph_id: egui::Id) -> Arc<Mutex<GraphTempMemory>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_adjust, align_nodes, dot_grid_step, infer_alignment, maintain_zoom_scene_rect,
-        snap_f32, wheel_zoom_scene_rect, AlignBy, AlignTargets, Alignment, Layout, NodeId, Snap,
+        align_adjust, align_nodes, collision_free_drag_delta, dot_grid_step, infer_alignment,
+        maintain_zoom_scene_rect, snap_f32, strict_rect_overlap, wheel_zoom_scene_rect, AlignBy,
+        AlignTargets, Alignment, Layout, NodeId, Snap,
     };
     use egui::{Rangef, Rect, Vec2};
     use std::collections::HashMap;
@@ -2279,6 +2456,59 @@ mod tests {
         assert_eq!(x.pos, 2.0); // the reference left edge
         assert_eq!(x.span, Rangef::new(0.0, 28.0));
         assert!(y.is_none());
+    }
+
+    #[test]
+    fn collision_projection_stops_at_exact_clearance() {
+        let selected = [rect(0.0, 0.0, 10.0, 10.0)];
+        let references = [rect(30.0, 0.0, 10.0, 10.0)];
+        let moved = collision_free_drag_delta(&selected, &references, egui::vec2(40.0, 0.0), 4.0);
+        assert_eq!(moved, egui::vec2(16.0, 0.0));
+        assert_eq!(selected[0].translate(moved).max.x, 26.0);
+    }
+
+    #[test]
+    fn collision_projection_slides_along_contacted_side() {
+        let selected = [rect(0.0, 0.0, 10.0, 10.0)];
+        let references = [rect(20.0, 0.0, 10.0, 30.0)];
+        let moved = collision_free_drag_delta(&selected, &references, egui::vec2(30.0, 20.0), 0.0);
+        assert_eq!(moved, egui::vec2(10.0, 20.0));
+        assert!(!strict_rect_overlap(
+            selected[0].translate(moved),
+            references[0]
+        ));
+    }
+
+    #[test]
+    fn collision_projection_prevents_large_delta_tunnelling() {
+        let selected = [rect(0.0, 0.0, 10.0, 10.0)];
+        let references = [rect(40.0, 0.0, 5.0, 10.0)];
+        let moved = collision_free_drag_delta(&selected, &references, egui::vec2(100.0, 0.0), 0.0);
+        assert!((moved.x - 30.0).abs() < 1e-4);
+        assert_eq!(moved.y, 0.0);
+    }
+
+    #[test]
+    fn collision_projection_keeps_group_rigid() {
+        let selected = [rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 20.0, 10.0, 10.0)];
+        let references = [rect(30.0, 20.0, 10.0, 10.0)];
+        let moved = collision_free_drag_delta(&selected, &references, egui::vec2(40.0, 0.0), 2.0);
+        assert_eq!(moved, egui::vec2(18.0, 0.0));
+        assert_eq!(
+            selected[1].translate(moved).min - selected[0].translate(moved).min,
+            egui::vec2(0.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn collision_projection_allows_escape_from_existing_overlap() {
+        let selected = [rect(0.0, 0.0, 10.0, 10.0)];
+        let references = [rect(5.0, 0.0, 10.0, 10.0)];
+        let requested = egui::vec2(-20.0, 0.0);
+        assert_eq!(
+            collision_free_drag_delta(&selected, &references, requested, 0.0),
+            requested
+        );
     }
 
     fn pos(x: f32, y: f32) -> egui::Pos2 {
