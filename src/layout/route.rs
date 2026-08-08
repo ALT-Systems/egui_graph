@@ -229,6 +229,9 @@ fn segment_rect_entry(p: egui::Pos2, q: egui::Pos2, rect: egui::Rect) -> Option<
 mod tests {
     use super::*;
 
+    type TestNode = (NodeId, egui::Pos2, LayoutNode);
+    type TestEdge = ((NodeId, usize), (NodeId, usize));
+
     fn nid(v: u64) -> NodeId {
         NodeId::from_u64(v)
     }
@@ -249,12 +252,7 @@ mod tests {
         )
     }
 
-    fn graph(
-        blocker_pos: [f32; 2],
-    ) -> (
-        Vec<(NodeId, egui::Pos2, LayoutNode)>,
-        Vec<((NodeId, usize), (NodeId, usize))>,
-    ) {
+    fn graph(blocker_pos: [f32; 2]) -> (Vec<TestNode>, Vec<TestEdge>) {
         let (a_pos, a) = out_node([0.0, 0.0]);
         let (c_pos, c) = in_node([300.0, 0.0]);
         let nodes = vec![

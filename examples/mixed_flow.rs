@@ -209,7 +209,8 @@ fn nodes(nctx: &mut egui_graph::NodesCtx, ui: &mut egui::Ui, state: &State) {
 
 fn edges(ectx: &mut egui_graph::EdgesCtx, ui: &mut egui::Ui, state: &State) {
     // Multiple edges between the same socket pair each get their own route.
-    let mut occurrences: HashMap<((NodeId, usize), (NodeId, usize)), usize> = HashMap::new();
+    type SocketPair = ((NodeId, usize), (NodeId, usize));
+    let mut occurrences: HashMap<SocketPair, usize> = HashMap::new();
     for &((s, so), (d, di)) in &state.edges {
         let (a, b) = ((node_id(s), so), (node_id(d), di));
         let occurrence = occurrences.entry((a, b)).or_default();
