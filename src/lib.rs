@@ -28,6 +28,9 @@ pub struct Graph {
     drag_pan_buttons: egui::containers::DragPanButtons,
     /// Whether a primary-button drag on empty canvas creates a selection box.
     marquee_selection: bool,
+    /// Whether a primary-button drag on empty canvas pans without claiming
+    /// primary gestures that begin on nodes or sockets.
+    primary_drag_pan_empty: bool,
     /// The base spacing of the dot grid in graph-space units, or `None` to
     /// derive it from the style's interaction size.
     dot_grid_step: Option<f32>,
@@ -224,6 +227,8 @@ enum PressAction {
     },
     /// The graph was pressed and we are performing a selection.
     Select,
+    /// Empty canvas was pressed and the camera is being panned.
+    Pan,
     /// A node's socket was pressed in order to start creating a connection.
     Socket(socket::Socket),
 }
@@ -328,6 +333,14 @@ struct GraphInteraction {
     select: bool,
     selection_rect: Option<egui::Rect>,
     drag_nodes_delta: egui::Vec2,
+    pan_delta: egui::Vec2,
+}
+
+#[derive(Clone, Copy)]
+struct CanvasGesture {
+    marquee_selection: bool,
+    primary_drag_pan_empty: bool,
+    pointer_delta_graph: egui::Vec2,
 }
 
 /// The response returned by [`Graph::show`].
@@ -392,6 +405,7 @@ impl Graph {
             wheel_zoom: false,
             drag_pan_buttons: egui::containers::DragPanButtons::MIDDLE,
             marquee_selection: true,
+            primary_drag_pan_empty: false,
             dot_grid_step: None,
             zoom_range: Self::DEFAULT_ZOOM_RANGE,
             max_inner_size: None,
@@ -450,6 +464,17 @@ impl Graph {
     /// Direct node clicks remain selectable when this is disabled.
     pub fn marquee_selection(mut self, enabled: bool) -> Self {
         self.marquee_selection = enabled;
+        self
+    }
+
+    /// Pan with a primary-button drag that begins on empty canvas.
+    ///
+    /// Unlike adding the primary button to [`drag_pan_buttons`](Self::drag_pan_buttons),
+    /// this participates in the graph's own hit testing. Nodes and sockets
+    /// therefore retain first claim on primary gestures, while the remaining
+    /// canvas behaves like a direct-manipulation surface.
+    pub fn primary_drag_pan_empty(mut self, enabled: bool) -> Self {
+        self.primary_drag_pan_empty = enabled;
         self
     }
 
@@ -728,6 +753,7 @@ impl Graph {
 
         // Track the bounding area of all widgets in the scene.
         let mut bounding_rect = None;
+        let mut primary_pan_delta = egui::Vec2::ZERO;
 
         let scene_response = scene.show(ui, scene_rect, |ui| {
             // Draw the selection rectangle if there is one.
@@ -798,8 +824,18 @@ impl Graph {
                     ptr_on_graph || closest_socket_for_interaction.is_some(),
                     ptr_graph,
                     gmem.pressed.as_ref(),
-                    self.marquee_selection,
+                    CanvasGesture {
+                        marquee_selection: self.marquee_selection,
+                        primary_drag_pan_empty: self.primary_drag_pan_empty,
+                        pointer_delta_graph: pointer.delta()
+                            / ui.ctx()
+                                .layer_transform_to_global(ui.layer_id())
+                                .map(|transform| transform.scaling)
+                                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                                .unwrap_or(1.0),
+                    },
                 );
+                primary_pan_delta = interaction.pan_delta;
 
                 // Move all selected nodes by a single delta (skip when
                 // immutable), keeping the group rigid (preserving its relative
@@ -1009,6 +1045,10 @@ impl Graph {
 
             (output, selection_changed)
         });
+
+        if primary_pan_delta != egui::Vec2::ZERO && !self.center_view {
+            *scene_rect = scene_rect.translate(primary_pan_delta);
+        }
 
         if self.center_view {
             if let Some(rect) = bounding_rect {
@@ -1404,11 +1444,12 @@ fn graph_interaction(
     ptr_on_graph: bool,
     ptr_graph: egui::Pos2,
     pressed: Option<&Pressed>,
-    marquee_selection: bool,
+    canvas: CanvasGesture,
 ) -> GraphInteraction {
     let mut select = false;
     let mut socket_press_released = None;
     let mut drag_nodes_delta = egui::Vec2::ZERO;
+    let mut pan_delta = egui::Vec2::ZERO;
     let mut selection_rect = None;
 
     // Check for selecting/dragging.
@@ -1429,6 +1470,7 @@ fn graph_interaction(
                 let max = ptr_graph;
                 selection_rect = Some(egui::Rect::from_two_pos(min, max));
             }
+            PressAction::Pan => pan_delta = -canvas.pointer_delta_graph,
             _ => (),
         }
 
@@ -1447,7 +1489,9 @@ fn graph_interaction(
             })
         }
     // Check for the beginning of a socket press or rectangular selection.
-    } else if marquee_selection
+    } else if (canvas.marquee_selection
+        || canvas.primary_drag_pan_empty
+        || closest_socket.is_some())
         && ptr_on_graph
         && pointer.button_down(egui::PointerButton::Primary)
         && pointer.button_pressed(egui::PointerButton::Primary)
@@ -1456,10 +1500,14 @@ fn graph_interaction(
         let action = match closest_socket {
             Some(socket) => PressAction::Socket(socket),
             None => {
-                let min = ptr_graph;
-                let max = ptr_graph;
-                selection_rect = Some(egui::Rect::from_two_pos(min, max));
-                PressAction::Select
+                if canvas.primary_drag_pan_empty {
+                    PressAction::Pan
+                } else {
+                    let min = ptr_graph;
+                    let max = ptr_graph;
+                    selection_rect = Some(egui::Rect::from_two_pos(min, max));
+                    PressAction::Select
+                }
             }
         };
 
@@ -1482,6 +1530,7 @@ fn graph_interaction(
         select,
         selection_rect,
         drag_nodes_delta,
+        pan_delta,
     }
 }
 
@@ -2109,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_viewer_primary_drag_pans_empty_canvas() {
+    fn primary_drag_pans_empty_canvas_without_scene_claiming_the_button() {
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
         let start = egui::pos2(300.0, 240.0);
@@ -2126,12 +2175,8 @@ mod tests {
         };
         let _ = ctx.run_ui(warmup, |ui| {
             super::Graph::new("primary-pan-integration")
-                .immutable(true)
-                .drag_pan_buttons(
-                    egui::containers::DragPanButtons::PRIMARY
-                        | egui::containers::DragPanButtons::MIDDLE,
-                )
                 .marquee_selection(false)
+                .primary_drag_pan_empty(true)
                 .show(&mut view, ui, |_ui, _show| {});
         });
 
@@ -2150,12 +2195,8 @@ mod tests {
         };
         let _ = ctx.run_ui(press, |ui| {
             super::Graph::new("primary-pan-integration")
-                .immutable(true)
-                .drag_pan_buttons(
-                    egui::containers::DragPanButtons::PRIMARY
-                        | egui::containers::DragPanButtons::MIDDLE,
-                )
                 .marquee_selection(false)
+                .primary_drag_pan_empty(true)
                 .show(&mut view, ui, |_ui, _show| {});
         });
         let before_drag = view.scene_rect;
@@ -2175,12 +2216,8 @@ mod tests {
                 input.pointer.button_down(egui::PointerButton::Primary)
             });
             let response = super::Graph::new("primary-pan-integration")
-                .immutable(true)
-                .drag_pan_buttons(
-                    egui::containers::DragPanButtons::PRIMARY
-                        | egui::containers::DragPanButtons::MIDDLE,
-                )
                 .marquee_selection(false)
+                .primary_drag_pan_empty(true)
                 .show(&mut view, ui, |_ui, _show| {});
             dragged = response.response.dragged_by(egui::PointerButton::Primary);
             delta = response.response.drag_delta();
