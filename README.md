@@ -2,9 +2,11 @@
 
 A general-purpose node graph widget for [egui](https://github.com/emilk/egui).
 
-## ALT fork
+## fixer-legacy fork
 
-This repository is ALT's narrow, upstream-tracking fork of [`nannou-org/egui_graph`](https://github.com/nannou-org/egui_graph). The `alt` branch retains upstream history and carries only the behavior required by ALT's native Team and execution canvases.
+> **Archived legacy project.** Maintained for [fixer-legacy](https://github.com/ALT-Infra/fixer-legacy) (formerly `ALT-TUI`). Preserved for reference.
+
+This repository is fixer-legacy's narrow, upstream-tracking fork of [`nannou-org/egui_graph`](https://github.com/nannou-org/egui_graph). The `fixer-legacy` branch retains upstream history and carries only the behavior required by fixer-legacy's native Team and execution canvases.
 
 The fork adds pointer-anchored wheel zoom without a modifier key, configurable primary-button canvas panning for read-only views, reflection-symmetric placement for degree-one boundary ports, and two-corner obstacle detours whose adjacent segments remain outside the blocked node. Each change is covered by a focused invariant test. Generic graph behavior otherwise remains upstream-owned, and applicable upstream changes should be merged rather than reimplemented here.
 
